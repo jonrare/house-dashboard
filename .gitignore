@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# amplify
+.amplify/
+amplify_outputs*
+amplifyconfiguration*
+
+# build output
+dist/
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
