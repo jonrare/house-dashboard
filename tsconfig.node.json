@@ -10,7 +10,10 @@
     "isolatedModules": true,
     "moduleDetection": "force",
     "noEmit": true,
-    "strict": true
+    "strict": true,
+    "paths": {
+      "$amplify/*": [".amplify/generated/*"]
+    }
   },
   "include": ["vite.config.ts", "amplify"]
 }
