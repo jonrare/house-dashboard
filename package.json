@@ -14,7 +14,6 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.65.0",
     "@aws-amplify/ui-react": "^6.5.5",
-    "@aws-sdk/client-secrets-manager": "^3.665.0",
     "aws-amplify": "^6.6.6",
     "imapflow": "^1.0.187",
     "mailparser": "^3.7.1",

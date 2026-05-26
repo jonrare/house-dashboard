@@ -35,7 +35,7 @@ export async function clearAlertsForBill(billId: string): Promise<void> {
 }
 
 export type Biller = Schema["Biller"]["type"];
-export type EmailAccount = Schema["EmailAccount"]["type"];
 export type SenderFilter = Schema["SenderFilter"]["type"];
 export type Bill = Schema["Bill"]["type"];
 export type Alert = Schema["Alert"]["type"];
+export type ScanRun = Schema["ScanRun"]["type"];

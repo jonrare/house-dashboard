@@ -19,6 +19,11 @@ export const scan = defineFunction({
   schedule: "every 1h",
   environment: {
     ANTHROPIC_API_KEY: secret("ANTHROPIC_API_KEY"),
+    // The single Gmail mailbox to scrape. Address is non-sensitive config (set it as
+    // an Amplify Hosting environment variable, picked up at deploy time); the App
+    // Password is a secret stored alongside ANTHROPIC_API_KEY.
+    GMAIL_ADDRESS: process.env.GMAIL_ADDRESS ?? "",
+    GMAIL_APP_PASSWORD: secret("GMAIL_APP_PASSWORD"),
     // Default model; can be overridden per environment.
     CLAUDE_MODEL: "claude-sonnet-4-6",
   },

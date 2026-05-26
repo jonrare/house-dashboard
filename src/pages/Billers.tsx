@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { client, listAll, type Biller, type SenderFilter, type EmailAccount } from "../client";
+import { client, listAll, type Biller, type SenderFilter } from "../client";
 
 const CATEGORIES = [
   "power", "gas", "water", "internet", "rent",
@@ -10,7 +10,6 @@ type Category = (typeof CATEGORIES)[number];
 export default function Billers() {
   const [billers, setBillers] = useState<Biller[]>([]);
   const [filters, setFilters] = useState<SenderFilter[]>([]);
-  const [accounts, setAccounts] = useState<EmailAccount[]>([]);
   const [name, setName] = useState("");
   const [category, setCategory] = useState<Category>("power");
   const [backfilling, setBackfilling] = useState<string | null>(null);
@@ -20,14 +19,12 @@ export default function Billers() {
   async function load() {
     setError(null);
     try {
-      const [b, f, a] = await Promise.all([
+      const [b, f] = await Promise.all([
         listAll((nextToken) => client.models.Biller.list({ nextToken })),
         listAll((nextToken) => client.models.SenderFilter.list({ nextToken })),
-        listAll((nextToken) => client.models.EmailAccount.list({ nextToken })),
       ]);
       setBillers(b);
       setFilters(f);
-      setAccounts(a);
     } catch (e) {
       setError(String(e));
     }
@@ -98,7 +95,6 @@ export default function Billers() {
           key={b.id}
           biller={b}
           filters={filters.filter((f) => f.billerId === b.id)}
-          accounts={accounts}
           backfilling={backfilling === b.id}
           onChange={load}
           onError={setError}
@@ -114,25 +110,22 @@ export default function Billers() {
 function BillerCard(props: {
   biller: Biller;
   filters: SenderFilter[];
-  accounts: EmailAccount[];
   backfilling: boolean;
   onChange: () => Promise<void>;
   onError: (msg: string) => void;
   onRemove: () => void;
   onBackfill: () => void;
 }) {
-  const { biller, filters, accounts, backfilling } = props;
-  const [accountId, setAccountId] = useState("");
+  const { biller, filters, backfilling } = props;
   const [matchType, setMatchType] = useState<"fromAddress" | "fromDomain">("fromAddress");
   const [matchValue, setMatchValue] = useState("");
   const [subjectContains, setSubjectContains] = useState("");
 
   async function addFilter(e: React.FormEvent) {
     e.preventDefault();
-    if (!accountId || !matchValue) return;
+    if (!matchValue) return;
     const res = await client.models.SenderFilter.create({
       billerId: biller.id,
-      emailAccountId: accountId,
       fromAddress: matchType === "fromAddress" ? matchValue : undefined,
       fromDomain: matchType === "fromDomain" ? matchValue : undefined,
       subjectContains: subjectContains || undefined,
@@ -174,8 +167,6 @@ function BillerCard(props: {
           <li key={f.id}>
             <code>{f.fromAddress ?? f.fromDomain}</code>
             {f.subjectContains ? ` · subject ~ "${f.subjectContains}"` : ""}
-            {" → "}
-            {accounts.find((a) => a.id === f.emailAccountId)?.emailAddress ?? "?"}
             <button className="link" onClick={() => removeFilter(f.id)}>remove</button>
           </li>
         ))}
@@ -183,10 +174,6 @@ function BillerCard(props: {
       </ul>
 
       <form className="form-row" onSubmit={addFilter}>
-        <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
-          <option value="">Select account…</option>
-          {accounts.map((a) => <option key={a.id} value={a.id}>{a.emailAddress}</option>)}
-        </select>
         <select value={matchType} onChange={(e) => setMatchType(e.target.value as typeof matchType)}>
           <option value="fromAddress">from address</option>
           <option value="fromDomain">from domain</option>

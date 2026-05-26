@@ -5,9 +5,10 @@ import { scan } from "../functions/scan/resource";
  * Data model for the bill tracker. Single Cognito user, so every model is
  * authorized with `allow.authenticated()`.
  *
- * Flow: EmailAccount + Biller + SenderFilter are user-managed config. The `scan`
- * function reads them, pulls matching Gmail messages, parses each with Claude, and
- * writes Bill (+ Alert) records. See amplify/functions/scan.
+ * Flow: Biller + SenderFilter are user-managed config. The `scan` function reads
+ * them, pulls matching messages from the one configured Gmail mailbox (GMAIL_ADDRESS
+ * env var + GMAIL_APP_PASSWORD secret), parses each with Claude, and writes Bill
+ * (+ Alert) records. ScanState holds the incremental cursor. See amplify/functions/scan.
  */
 const schema = a
   .schema({
@@ -28,24 +29,7 @@ const schema = a
 
     AlertType: a.enum(["disconnect", "eviction", "pastdue", "other"]),
 
-    AccountStatus: a.enum(["active", "error", "disabled"]),
-
     ScanMode: a.enum(["scheduled", "manual", "backfill"]),
-
-    /** A Gmail mailbox to scrape. The App Password lives in Secrets Manager. */
-    EmailAccount: a
-      .model({
-        emailAddress: a.string().required(),
-        provider: a.string().default("gmail"),
-        // Secrets Manager secret name holding the IMAP App Password — never the password itself.
-        credentialRef: a.string().required(),
-        status: a.ref("AccountStatus"),
-        lastScanAt: a.datetime(),
-        lastError: a.string(),
-        senderFilters: a.hasMany("SenderFilter", "emailAccountId"),
-        bills: a.hasMany("Bill", "emailAccountId"),
-      })
-      .authorization((allow) => [allow.authenticated()]),
 
     /** A biller the user wants to track (power, rent, internet, ...). */
     Biller: a
@@ -58,13 +42,11 @@ const schema = a
       })
       .authorization((allow) => [allow.authenticated()]),
 
-    /** Which sender (in which account) maps to a Biller. */
+    /** Which sender maps to a Biller (matched against the one configured mailbox). */
     SenderFilter: a
       .model({
         billerId: a.id().required(),
         biller: a.belongsTo("Biller", "billerId"),
-        emailAccountId: a.id().required(),
-        emailAccount: a.belongsTo("EmailAccount", "emailAccountId"),
         fromAddress: a.string(),
         fromDomain: a.string(),
         subjectContains: a.string(),
@@ -76,8 +58,6 @@ const schema = a
       .model({
         billerId: a.id().required(),
         biller: a.belongsTo("Biller", "billerId"),
-        emailAccountId: a.id().required(),
-        emailAccount: a.belongsTo("EmailAccount", "emailAccountId"),
         messageId: a.string().required(),
         amount: a.float(),
         currency: a.string().default("USD"),
@@ -114,7 +94,6 @@ const schema = a
     ScanRun: a
       .model({
         mode: a.ref("ScanMode").required(),
-        emailAccountId: a.id(),
         startedAt: a.datetime(),
         finishedAt: a.datetime(),
         messagesScanned: a.integer().default(0),
@@ -123,10 +102,19 @@ const schema = a
       })
       .authorization((allow) => [allow.authenticated()]),
 
-    /** Run a scan now (all accounts, or one). Resolved by the `scan` function. */
+    /**
+     * Singleton holding the incremental-scan cursor. The scan function reads/writes
+     * one row with a fixed id ("global"); `lastScanAt` is where the next scan resumes.
+     */
+    ScanState: a
+      .model({
+        lastScanAt: a.datetime(),
+      })
+      .authorization((allow) => [allow.authenticated()]),
+
+    /** Run a scan now over the configured mailbox. Resolved by the `scan` function. */
     triggerScan: a
       .mutation()
-      .arguments({ emailAccountId: a.string() })
       .returns(a.json())
       .handler(a.handler.function(scan))
       .authorization((allow) => [allow.authenticated()]),

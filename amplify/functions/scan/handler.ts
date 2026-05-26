@@ -5,21 +5,20 @@ import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtim
 import { env } from "$amplify/env/scan";
 import type { Schema } from "../../data/resource";
 import { fetchMatchingEmails, type SenderQuery } from "./gmail";
-import { getAppPassword } from "./secrets";
 import { parseBillEmail } from "./parse";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
 Amplify.configure(resourceConfig, libraryOptions);
 const client = generateClient<Schema>();
 
-const DEFAULT_LOOKBACK_DAYS = 14; // for the first scheduled scan of an account
+const DEFAULT_LOOKBACK_DAYS = 14; // for the very first scheduled scan
 const BACKFILL_DAYS = 365;
+const SCAN_STATE_ID = "global"; // singleton ScanState row holding the incremental cursor
 
 type Mode = "scheduled" | "manual" | "backfill";
 type SenderFilterRecord = Schema["SenderFilter"]["type"];
 
 interface ScanArgs {
-  emailAccountId?: string | null;
   billerId?: string | null;
   sinceDays?: number | null;
 }
@@ -53,7 +52,7 @@ function assertOk(label: string, res: { errors?: unknown }): void {
 
 /**
  * Entry point. Distinguishes its three roles by event shape:
- *  - AppSync mutation `triggerScan`   → manual scan
+ *  - AppSync mutation `triggerScan`   → manual scan of the configured mailbox
  *  - AppSync mutation `backfillBiller` → backfill one biller
  *  - EventBridge scheduled event       → hourly incremental scan
  */
@@ -74,7 +73,7 @@ export const handler = async (
     if (mode === "backfill") {
       await runBackfill(args.billerId ?? null, args.sinceDays ?? BACKFILL_DAYS, summary);
     } else {
-      await runScan(args.emailAccountId ?? null, startedAt, summary);
+      await runScan(startedAt, summary);
     }
   } catch (err) {
     summary.errors.push(String(err));
@@ -93,56 +92,26 @@ export const handler = async (
   return summary;
 };
 
-/** Scheduled / manual: scan all active accounts (or one) since their lastScanAt. */
-async function runScan(
-  onlyAccountId: string | null,
-  startedAt: string,
-  summary: ScanSummary,
-): Promise<void> {
-  const accounts = await listAll((nextToken) =>
-    client.models.EmailAccount.list({ nextToken }),
+/** Scheduled / manual: scan all sender filters since the last successful scan. */
+async function runScan(startedAt: string, summary: ScanSummary): Promise<void> {
+  const filters = await listAll((nextToken) =>
+    client.models.SenderFilter.list({ nextToken }),
   );
+  if (filters.length === 0) return;
 
-  for (const account of accounts) {
-    if (onlyAccountId && account.id !== onlyAccountId) continue;
-    if (account.status === "disabled") continue;
+  const { data: state } = await client.models.ScanState.get({ id: SCAN_STATE_ID });
+  const since = state?.lastScanAt
+    ? new Date(state.lastScanAt)
+    : daysAgo(DEFAULT_LOOKBACK_DAYS);
 
-    const filters = await listAll((nextToken) =>
-      client.models.SenderFilter.list({
-        filter: { emailAccountId: { eq: account.id } },
-        nextToken,
-      }),
-    );
-    if (filters.length === 0) continue;
+  await scanFilters(filters, since, summary);
 
-    const since = account.lastScanAt
-      ? new Date(account.lastScanAt)
-      : daysAgo(DEFAULT_LOOKBACK_DAYS);
-
-    try {
-      await scanAccount(account.emailAddress, account.credentialRef!, filters, since, summary);
-      // Use startedAt (not now) so messages that arrived mid-scan aren't skipped next run.
-      assertOk(
-        "EmailAccount.update",
-        await client.models.EmailAccount.update({
-          id: account.id,
-          status: "active",
-          lastScanAt: startedAt,
-          lastError: undefined,
-        }),
-      );
-    } catch (err) {
-      summary.errors.push(`${account.emailAddress}: ${err}`);
-      await client.models.EmailAccount.update({
-        id: account.id,
-        status: "error",
-        lastError: String(err),
-      });
-    }
-  }
+  // Advance the cursor only after a clean run (a throw above skips this). Use startedAt,
+  // not now, so messages that arrived mid-scan aren't skipped next run.
+  await upsertScanState(startedAt);
 }
 
-/** Backfill: scan the accounts referenced by one biller's sender filters. */
+/** Backfill one biller's senders. Does not move the incremental cursor. */
 async function runBackfill(
   billerId: string | null,
   sinceDays: number,
@@ -155,33 +124,21 @@ async function runBackfill(
   );
   if (filters.length === 0) return;
 
-  const since = daysAgo(sinceDays);
-  const byAccount = new Map<string, SenderFilterRecord[]>();
-  for (const f of filters) {
-    const list = byAccount.get(f.emailAccountId) ?? [];
-    list.push(f);
-    byAccount.set(f.emailAccountId, list);
-  }
-
-  for (const [accountId, accountFilters] of byAccount) {
-    const { data: account } = await client.models.EmailAccount.get({ id: accountId });
-    if (!account) continue;
-    try {
-      await scanAccount(account.emailAddress, account.credentialRef!, accountFilters, since, summary);
-    } catch (err) {
-      summary.errors.push(`${account.emailAddress}: ${err}`);
-    }
-  }
+  await scanFilters(filters, daysAgo(sinceDays), summary);
 }
 
-/** Fetch → dedupe → parse → write Bills/Alerts for one account. */
-async function scanAccount(
-  emailAddress: string,
-  credentialRef: string,
+/** Fetch → dedupe → parse → write Bills/Alerts for the given sender filters. */
+async function scanFilters(
   filters: SenderFilterRecord[],
   since: Date,
   summary: ScanSummary,
 ): Promise<void> {
+  const gmailAddress = env.GMAIL_ADDRESS;
+  const appPassword = env.GMAIL_APP_PASSWORD;
+  if (!gmailAddress || !appPassword) {
+    throw new Error("GMAIL_ADDRESS env var and GMAIL_APP_PASSWORD secret must be configured");
+  }
+
   const byId = new Map(filters.map((f) => [f.id, f]));
   const queries: SenderQuery[] = filters.map((f) => ({
     id: f.id,
@@ -190,8 +147,7 @@ async function scanAccount(
     subjectContains: f.subjectContains,
   }));
 
-  const appPassword = await getAppPassword(credentialRef);
-  const emails = await fetchMatchingEmails({ emailAddress, appPassword, queries, since });
+  const emails = await fetchMatchingEmails({ emailAddress: gmailAddress, appPassword, queries, since });
   summary.messagesScanned += emails.length;
 
   for (const email of emails) {
@@ -211,7 +167,6 @@ async function scanAccount(
 
     const created = await client.models.Bill.create({
       billerId: filter.billerId,
-      emailAccountId: filter.emailAccountId,
       messageId: email.messageId,
       amount: parsed.amount ?? undefined,
       currency: parsed.currency ?? "USD",
@@ -250,6 +205,22 @@ async function scanAccount(
         }),
       );
     }
+  }
+}
+
+/** Upsert the singleton scan cursor. */
+async function upsertScanState(lastScanAt: string): Promise<void> {
+  const { data: existing } = await client.models.ScanState.get({ id: SCAN_STATE_ID });
+  if (existing) {
+    assertOk(
+      "ScanState.update",
+      await client.models.ScanState.update({ id: SCAN_STATE_ID, lastScanAt }),
+    );
+  } else {
+    assertOk(
+      "ScanState.create",
+      await client.models.ScanState.create({ id: SCAN_STATE_ID, lastScanAt }),
+    );
   }
 }
 
