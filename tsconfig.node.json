@@ -12,7 +12,7 @@
     "noEmit": true,
     "strict": true,
     "paths": {
-      "$amplify/*": [".amplify/generated/*"]
+      "$amplify/*": ["./.amplify/generated/*"]
     }
   },
   "include": ["vite.config.ts", "amplify"]
