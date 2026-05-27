@@ -58,16 +58,17 @@ const schema = a
       .authorization((allow) => [allow.authenticated()]),
 
     /**
-     * A billing account with a running balance, identified by biller + account number.
-     * Every field below `accountNumber` is *derived* by replaying this account's ledger
-     * entries (see amplify/functions/scan/ledger.ts) — never edited directly by hand.
+     * A billing account with a running balance. There is one Account per Biller — the
+     * account number is only a display detail (providers state it inconsistently, e.g.
+     * masked as "**1344" or omitted), never an identity key. Every field below `label`
+     * is *derived* by replaying this account's ledger entries (see
+     * amplify/functions/scan/ledger.ts) — never edited directly by hand.
      */
     Account: a
       .model({
         billerId: a.id().required(),
         biller: a.belongsTo("Biller", "billerId"),
-        // Provider account number (e.g. "2803243"); "" when the biller states none.
-        accountNumber: a.string().required(),
+        accountNumber: a.string(), // best-known provider account number, for display only
         label: a.string(), // e.g. service location / type, for display
         currentAmount: a.float().default(0), // current-period charges outstanding
         pastDueAmount: a.float().default(0), // overdue portion outstanding

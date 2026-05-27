@@ -263,13 +263,17 @@ function toEvent(e: LedgerEntryRecord): LedgerEvent {
   };
 }
 
-/** Resolves/creates Accounts by (biller, accountNumber), loading each biller's set once. */
+/**
+ * Resolves the single Account per biller, creating it on first sight. The account number
+ * is not an identity key (providers state it inconsistently); we just keep the most
+ * complete one we've seen, so the same biller never fragments into multiple accounts.
+ */
 class AccountCache {
-  private byKey = new Map<string, AccountRecord>();
-  private loadedBillers = new Set<string>();
+  private byBiller = new Map<string, AccountRecord>();
+  private loaded = false;
 
-  private static key(billerId: string, accountNumber: string): string {
-    return `${billerId}::${accountNumber}`;
+  private static digits(s: string | null | undefined): string {
+    return (s ?? "").replace(/\D/g, "");
   }
 
   async getOrCreate(
@@ -277,28 +281,41 @@ class AccountCache {
     accountNumber: string,
     label: string | null,
   ): Promise<AccountRecord> {
-    if (!this.loadedBillers.has(billerId)) {
-      const existing = await listAll((nextToken) =>
-        client.models.Account.list({ filter: { billerId: { eq: billerId } }, nextToken }),
-      );
+    if (!this.loaded) {
+      const existing = await listAll((nextToken) => client.models.Account.list({ nextToken }));
       for (const acc of existing) {
-        this.byKey.set(AccountCache.key(billerId, acc.accountNumber ?? ""), acc);
+        if (!this.byBiller.has(acc.billerId)) this.byBiller.set(acc.billerId, acc);
       }
-      this.loadedBillers.add(billerId);
+      this.loaded = true;
     }
 
-    const key = AccountCache.key(billerId, accountNumber);
-    const found = this.byKey.get(key);
-    if (found) return found;
+    const found = this.byBiller.get(billerId);
+    if (found) {
+      // Enrich display details if this email carries a fuller account number or a label.
+      const patch: { accountNumber?: string; label?: string } = {};
+      if (
+        accountNumber &&
+        AccountCache.digits(accountNumber).length > AccountCache.digits(found.accountNumber).length
+      ) {
+        patch.accountNumber = accountNumber;
+      }
+      if (label && !found.label) patch.label = label;
+      if (Object.keys(patch).length) {
+        const updated = await client.models.Account.update({ id: found.id, ...patch });
+        assertOk("Account.update", updated);
+        if (updated.data) Object.assign(found, updated.data);
+      }
+      return found;
+    }
 
     const created = await client.models.Account.create({
       billerId,
-      accountNumber,
+      accountNumber: accountNumber || undefined,
       label: label ?? undefined,
     });
     assertOk("Account.create", created);
     const account = created.data!;
-    this.byKey.set(key, account);
+    this.byBiller.set(billerId, account);
     return account;
   }
 }
