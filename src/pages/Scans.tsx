@@ -41,11 +41,11 @@ export default function Scans() {
     }
   }
 
-  // Delete every imported Bill and Alert so you can re-scan from a clean slate.
-  // Leaves billers, sender filters, and the scan cursor untouched; a Backfill
-  // re-imports history.
+  // Delete every imported Bill and Alert AND reset the incremental scan cursor, so a
+  // plain "Scan now" afterward re-pulls recent mail instead of finding nothing. Billers
+  // and sender filters are kept. (A Backfill still re-pulls the full 12-month history.)
   async function clearBills() {
-    if (!confirm("Delete ALL imported bills and alerts? Billers and filters are kept. A re-scan or backfill can re-import them.")) return;
+    if (!confirm("Delete ALL imported bills and alerts, and reset the scan position? Billers and filters are kept. A scan or backfill will re-import them.")) return;
     setClearing(true);
     setError(null);
     setNotice(null);
@@ -54,7 +54,9 @@ export default function Scans() {
       await Promise.all(alerts.map((a) => client.models.Alert.delete({ id: a.id })));
       const bills = await listAll((nextToken) => client.models.Bill.list({ nextToken }));
       await Promise.all(bills.map((b) => client.models.Bill.delete({ id: b.id })));
-      setNotice(`Cleared ${bills.length} bill(s) and ${alerts.length} alert(s).`);
+      // Reset the cursor so the next scan starts over (it's a no-op if none exists yet).
+      await client.models.ScanState.delete({ id: "global" });
+      setNotice(`Cleared ${bills.length} bill(s) and ${alerts.length} alert(s), and reset the scan position.`);
     } catch (e) {
       setError(String(e));
     } finally {

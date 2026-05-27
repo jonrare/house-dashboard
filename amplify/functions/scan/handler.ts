@@ -11,7 +11,7 @@ const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env)
 Amplify.configure(resourceConfig, libraryOptions);
 const client = generateClient<Schema>();
 
-const DEFAULT_LOOKBACK_DAYS = 14; // for the very first scheduled scan
+const DEFAULT_LOOKBACK_DAYS = 45; // first scan, or the next scan after the cursor is reset
 const BACKFILL_DAYS = 365;
 const SCAN_STATE_ID = "global"; // singleton ScanState row holding the incremental cursor
 
