@@ -92,6 +92,8 @@ const schema = a
         kind: a.ref("LedgerKind").required(),
         // Magnitude of the event: payment/fee/adjustment amount.
         amount: a.float(),
+        // Provider transaction/confirmation id, used to dedupe duplicate payment notices.
+        reference: a.string(),
         // Snapshot values a statement/notice asserts, used to recompute the balance.
         assertedTotalDue: a.float(),
         assertedPastDue: a.float(),

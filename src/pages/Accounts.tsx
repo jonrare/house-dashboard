@@ -6,6 +6,7 @@ import {
   type Biller,
   type LedgerEntry,
 } from "../client";
+import { projectAccount, type LedgerEvent } from "../../amplify/functions/scan/ledger";
 
 export default function Accounts() {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -54,6 +55,34 @@ export default function Accounts() {
     if (!confirm("Delete this account and all of its ledger entries? A future scan can re-import them.")) return;
     try {
       await deleteAccountCascade(id);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  // Delete one ledger entry and recompute the account's balance from what's left,
+  // reusing the same projection the scan uses so the math always matches.
+  async function removeEntry(account: Account, entry: LedgerEntry) {
+    if (!confirm("Delete this ledger entry and recompute the balance?")) return;
+    try {
+      const del = await client.models.LedgerEntry.delete({ id: entry.id });
+      if (del.errors?.length) { setError(del.errors.map((x) => x.message).join("; ")); return; }
+
+      const remaining = (entriesByAccount.get(account.id) ?? []).filter((e) => e.id !== entry.id);
+      const s = projectAccount(remaining.map(toEvent));
+      const upd = await client.models.Account.update({
+        id: account.id,
+        currentAmount: s.currentAmount,
+        pastDueAmount: s.pastDueAmount,
+        balance: s.balance,
+        dueDate: s.dueDate ?? null,
+        cutoffDate: s.cutoffDate ?? null,
+        isPastDue: s.isPastDue,
+        isDisconnectWarning: s.isDisconnectWarning,
+        isEvictionNotice: s.isEvictionNotice,
+        lastEventAt: s.lastEventAt ?? null,
+      });
+      if (upd.errors?.length) setError(upd.errors.map((x) => x.message).join("; "));
     } catch (e) {
       setError(String(e));
     }
@@ -115,6 +144,7 @@ export default function Accounts() {
                             <th>Amount</th>
                             <th>Asserted total</th>
                             <th>Email</th>
+                            <th></th>
                           </tr>
                         </thead>
                         <tbody>
@@ -137,10 +167,13 @@ export default function Accounts() {
                                   </>
                                 )}
                               </td>
+                              <td className="actions">
+                                <button className="link" onClick={() => removeEntry(a, e)}>remove</button>
+                              </td>
                             </tr>
                           ))}
                           {accountEntries.length === 0 && (
-                            <tr><td colSpan={5}>No ledger entries.</td></tr>
+                            <tr><td colSpan={6}>No ledger entries.</td></tr>
                           )}
                         </tbody>
                       </table>
@@ -161,6 +194,23 @@ export default function Accounts() {
 
 function byEventDate(e: LedgerEntry): string {
   return e.eventDate ?? e.receivedAt ?? "";
+}
+
+function toEvent(e: LedgerEntry): LedgerEvent {
+  return {
+    kind: (e.kind ?? "statement") as LedgerEvent["kind"],
+    amount: e.amount ?? null,
+    assertedTotalDue: e.assertedTotalDue ?? null,
+    assertedPastDue: e.assertedPastDue ?? null,
+    assertedCurrent: e.assertedCurrent ?? null,
+    eventDate: e.eventDate ?? null,
+    dueDate: e.dueDate ?? null,
+    cutoffDate: e.cutoffDate ?? null,
+    isPastDue: !!e.isPastDue,
+    isDisconnectWarning: !!e.isDisconnectWarning,
+    isEvictionNotice: !!e.isEvictionNotice,
+    receivedAt: e.receivedAt ?? null,
+  };
 }
 
 function flagText(a: Account): string {

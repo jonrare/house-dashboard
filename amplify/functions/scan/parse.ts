@@ -31,6 +31,9 @@ Amounts are plain numbers (no currency symbols). For a "statement", capture what
 Capture only what the email actually states; leave the others null. Do NOT compute or infer values.
 
 Other fields:
+- reference: for a payment, the transaction / confirmation / authorization id if present
+  (e.g. "Transaction ID: 5999059" → "5999059"); else null. This is used to recognize the
+  same payment reported more than once.
 - accountNumber: the provider account number if present (e.g. "2803243"); else null.
 - eventDate: ISO date (YYYY-MM-DD) the event happened — the payment date, or the statement date.
   Resolve relative dates using the email's received date.
@@ -64,6 +67,10 @@ const RECORD_EVENT_TOOL: Anthropic.Tool = {
         type: ["number", "null"],
         description: "Payment / fee / adjustment amount (for kind payment, fee, or adjustment).",
       },
+      reference: {
+        type: ["string", "null"],
+        description: "Payment transaction / confirmation / authorization id, if present.",
+      },
       assertedTotalDue: { type: ["number", "null"], description: "Total amount due stated (statement)." },
       assertedPastDue: { type: ["number", "null"], description: "Past-due portion stated (statement)." },
       assertedCurrent: { type: ["number", "null"], description: "Current charges stated (statement)." },
@@ -92,6 +99,7 @@ export interface ParsedEvent {
   accountNumber: string | null;
   label: string | null;
   amount: number | null;
+  reference: string | null;
   assertedTotalDue: number | null;
   assertedPastDue: number | null;
   assertedCurrent: number | null;
@@ -152,6 +160,7 @@ export async function parseBillEmail(email: EmailForParsing): Promise<ParsedEven
     accountNumber: input.accountNumber ?? null,
     label: input.label ?? null,
     amount: input.amount ?? null,
+    reference: input.reference ?? null,
     assertedTotalDue: input.assertedTotalDue ?? null,
     assertedPastDue: input.assertedPastDue ?? null,
     assertedCurrent: input.assertedCurrent ?? null,

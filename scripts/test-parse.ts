@@ -96,7 +96,12 @@ const emailCases: { name: string; email: EmailForParsing; expect: (r: Awaited<Re
       receivedAt: "2026-05-25T15:11:00Z",
       body: "Your payment of $236.01 has been processed. Thank you. Transaction ID: 5999059. Account: 2803243. Amount: $236.01.",
     },
-    expect: (r) => r.isRelevant && r.kind === "payment" && r.amount === 236.01 && r.accountNumber === "2803243",
+    expect: (r) =>
+      r.isRelevant &&
+      r.kind === "payment" &&
+      r.amount === 236.01 &&
+      r.accountNumber === "2803243" &&
+      r.reference === "5999059",
   },
 ];
 

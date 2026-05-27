@@ -5,7 +5,7 @@ import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtim
 import { env } from "$amplify/env/scan";
 import type { Schema } from "../../data/resource";
 import { fetchMatchingEmails, type SenderQuery } from "./gmail";
-import { parseBillEmail } from "./parse";
+import { parseBillEmail, type ParsedEvent } from "./parse";
 import { projectAccount, type LedgerEvent } from "./ledger";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
@@ -176,12 +176,17 @@ async function scanFilters(
     const accountNumber = parsed.accountNumber?.trim() || "";
     const account = await accounts.getOrCreate(filter.billerId, accountNumber, parsed.label);
 
+    // Payment idempotency: the same payment is often emailed more than once (and two
+    // scans can race the messageId check). Skip if we already recorded this transaction.
+    if (parsed.kind === "payment" && (await isDuplicatePayment(account.id, parsed))) continue;
+
     const created = await client.models.LedgerEntry.create({
       accountId: account.id,
       billerId: filter.billerId,
       messageId: email.messageId,
       kind: parsed.kind,
       amount: parsed.amount ?? undefined,
+      reference: parsed.reference ?? undefined,
       assertedTotalDue: parsed.assertedTotalDue ?? undefined,
       assertedPastDue: parsed.assertedPastDue ?? undefined,
       assertedCurrent: parsed.assertedCurrent ?? undefined,
@@ -225,6 +230,20 @@ async function recomputeAccount(accountId: string): Promise<void> {
       lastEventAt: state.lastEventAt ?? null,
     }),
   );
+}
+
+/** True if a payment with this transaction reference (or same amount + date) is already recorded. */
+async function isDuplicatePayment(accountId: string, parsed: ParsedEvent): Promise<boolean> {
+  const entries = await listAll((nextToken) =>
+    client.models.LedgerEntry.list({ filter: { accountId: { eq: accountId } }, nextToken }),
+  );
+  const ref = parsed.reference?.trim();
+  return entries.some((e) => {
+    if (e.kind !== "payment") return false;
+    if (ref) return (e.reference ?? "").trim() === ref;
+    // No reference to match on: fall back to the same amount on the same day.
+    return e.amount === parsed.amount && (e.eventDate ?? null) === (parsed.eventDate ?? null);
+  });
 }
 
 function toEvent(e: LedgerEntryRecord): LedgerEvent {
