@@ -26,16 +26,17 @@ export async function listAll<T>(
   return out;
 }
 
-/** Delete every Alert tied to a bill (used when a bill is paid, dismissed, or deleted). */
-export async function clearAlertsForBill(billId: string): Promise<void> {
-  const alerts = await listAll((nextToken) =>
-    client.models.Alert.list({ filter: { billId: { eq: billId } }, nextToken }),
+/** Delete an account and every ledger entry under it. */
+export async function deleteAccountCascade(accountId: string): Promise<void> {
+  const entries = await listAll((nextToken) =>
+    client.models.LedgerEntry.list({ filter: { accountId: { eq: accountId } }, nextToken }),
   );
-  await Promise.all(alerts.map((a) => client.models.Alert.delete({ id: a.id })));
+  await Promise.all(entries.map((e) => client.models.LedgerEntry.delete({ id: e.id })));
+  await client.models.Account.delete({ id: accountId });
 }
 
 export type Biller = Schema["Biller"]["type"];
 export type SenderFilter = Schema["SenderFilter"]["type"];
-export type Bill = Schema["Bill"]["type"];
-export type Alert = Schema["Alert"]["type"];
+export type Account = Schema["Account"]["type"];
+export type LedgerEntry = Schema["LedgerEntry"]["type"];
 export type ScanRun = Schema["ScanRun"]["type"];

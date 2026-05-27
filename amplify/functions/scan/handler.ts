@@ -5,7 +5,8 @@ import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtim
 import { env } from "$amplify/env/scan";
 import type { Schema } from "../../data/resource";
 import { fetchMatchingEmails, type SenderQuery } from "./gmail";
-import { parseBillEmail, type BillCandidate } from "./parse";
+import { parseBillEmail } from "./parse";
+import { projectAccount, type LedgerEvent } from "./ledger";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
 Amplify.configure(resourceConfig, libraryOptions);
@@ -17,7 +18,8 @@ const SCAN_STATE_ID = "global"; // singleton ScanState row holding the increment
 
 type Mode = "scheduled" | "manual" | "backfill";
 type SenderFilterRecord = Schema["SenderFilter"]["type"];
-type BillRecord = Schema["Bill"]["type"];
+type AccountRecord = Schema["Account"]["type"];
+type LedgerEntryRecord = Schema["LedgerEntry"]["type"];
 
 interface ScanArgs {
   billerId?: string | null;
@@ -27,7 +29,7 @@ interface ScanArgs {
 interface ScanSummary {
   mode: Mode;
   messagesScanned: number;
-  billsCreated: number;
+  entriesRecorded: number;
   errors: string[];
 }
 
@@ -68,7 +70,7 @@ export const handler = async (
   else if (fieldName === "triggerScan") mode = "manual";
 
   const startedAt = new Date().toISOString();
-  const summary: ScanSummary = { mode, messagesScanned: 0, billsCreated: 0, errors: [] };
+  const summary: ScanSummary = { mode, messagesScanned: 0, entriesRecorded: 0, errors: [] };
 
   try {
     if (mode === "backfill") {
@@ -85,7 +87,7 @@ export const handler = async (
     startedAt,
     finishedAt: new Date().toISOString(),
     messagesScanned: summary.messagesScanned,
-    billsCreated: summary.billsCreated,
+    entriesRecorded: summary.entriesRecorded,
     errors: summary.errors.length ? summary.errors.join("; ") : undefined,
   });
   if (run.errors) console.error("ScanRun.create failed:", run.errors);
@@ -128,7 +130,7 @@ async function runBackfill(
   await scanFilters(filters, daysAgo(sinceDays), summary);
 }
 
-/** Fetch → dedupe → reconcile (create / update / skip) → write Bills/Alerts. */
+/** Fetch → dedupe → record a LedgerEntry → recompute the affected Account. */
 async function scanFilters(
   filters: SenderFilterRecord[],
   since: Date,
@@ -151,28 +153,14 @@ async function scanFilters(
   const emails = await fetchMatchingEmails({ emailAddress: gmailAddress, appPassword, queries, since });
   summary.messagesScanned += emails.length;
 
-  // Process oldest first so a payment/resolution email is seen after the bill it affects.
+  // Oldest first so a payment is recorded after the statement it pays (replay re-sorts anyway).
   emails.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt));
 
-  // Recent bills per biller, used as reconciliation context for the parser. Seeded from the
-  // DB on first use and kept in sync as we create/update bills within this run.
-  const candidatesByBiller = new Map<string, BillRecord[]>();
-  async function candidatesFor(billerId: string): Promise<BillRecord[]> {
-    let bills = candidatesByBiller.get(billerId);
-    if (!bills) {
-      const all = await listAll((nextToken) =>
-        client.models.Bill.list({ filter: { billerId: { eq: billerId } }, nextToken }),
-      );
-      all.sort((a, b) => (b.receivedAt ?? "").localeCompare(a.receivedAt ?? ""));
-      bills = all.slice(0, 25);
-      candidatesByBiller.set(billerId, bills);
-    }
-    return bills;
-  }
+  const accounts = new AccountCache();
 
   for (const email of emails) {
     // Dedupe via the messageId secondary index (deterministic, unlike a filtered scan).
-    const dupe = await client.models.Bill.listBillByMessageId(
+    const dupe = await client.models.LedgerEntry.listLedgerEntryByMessageId(
       { messageId: email.messageId },
       { limit: 1 },
     );
@@ -182,108 +170,117 @@ async function scanFilters(
     const filter = byId.get(email.matchedQueryId);
     if (!filter) continue;
 
-    const candidates = await candidatesFor(filter.billerId);
-    const parsed = await parseBillEmail(email, candidates.map(toCandidate));
+    const parsed = await parseBillEmail(email);
+    if (!parsed.isRelevant) continue;
 
-    if (parsed.action === "skip") continue;
+    const accountNumber = parsed.accountNumber?.trim() || "";
+    const account = await accounts.getOrCreate(filter.billerId, accountNumber, parsed.label);
 
-    const target =
-      parsed.action === "update" && parsed.targetIndex != null
-        ? candidates[parsed.targetIndex]
-        : undefined;
+    const created = await client.models.LedgerEntry.create({
+      accountId: account.id,
+      billerId: filter.billerId,
+      messageId: email.messageId,
+      kind: parsed.kind,
+      amount: parsed.amount ?? undefined,
+      assertedTotalDue: parsed.assertedTotalDue ?? undefined,
+      assertedPastDue: parsed.assertedPastDue ?? undefined,
+      assertedCurrent: parsed.assertedCurrent ?? undefined,
+      eventDate: parsed.eventDate ?? email.receivedAt.slice(0, 10),
+      dueDate: parsed.dueDate ?? undefined,
+      cutoffDate: parsed.cutoffDate ?? undefined,
+      isPastDue: parsed.isPastDue,
+      isDisconnectWarning: parsed.isDisconnectWarning,
+      isEvictionNotice: parsed.isEvictionNotice,
+      confidence: parsed.confidence,
+      subject: email.subject,
+      sourceSnippet: email.body.slice(0, 500),
+      receivedAt: email.receivedAt,
+    });
+    assertOk("LedgerEntry.create", created);
+    summary.entriesRecorded += 1;
 
-    if (target) {
-      // Update an existing bill (e.g. a payment that resolves a past-due/disconnect notice).
-      const updated = await client.models.Bill.update({
-        id: target.id,
-        amount: parsed.amount ?? undefined,
-        currency: parsed.currency ?? "USD",
-        balance: parsed.balance ?? undefined,
-        statementDate: parsed.statementDate ?? undefined,
-        dueDate: parsed.dueDate ?? undefined,
-        status: parsed.status,
-        isPastDue: parsed.isPastDue,
-        isDisconnectWarning: parsed.isDisconnectWarning,
-        isEvictionNotice: parsed.isEvictionNotice,
-        confidence: parsed.confidence,
-      });
-      assertOk("Bill.update", updated);
-      if (updated.data) Object.assign(target, updated.data); // keep the cached candidate current
-      await syncAlerts(target.id, parsed, email.subject);
-    } else {
-      // Create a new bill.
-      const created = await client.models.Bill.create({
-        billerId: filter.billerId,
-        messageId: email.messageId,
-        amount: parsed.amount ?? undefined,
-        currency: parsed.currency ?? "USD",
-        balance: parsed.balance ?? undefined,
-        statementDate: parsed.statementDate ?? undefined,
-        dueDate: parsed.dueDate ?? undefined,
-        status: parsed.status,
-        isPastDue: parsed.isPastDue,
-        isDisconnectWarning: parsed.isDisconnectWarning,
-        isEvictionNotice: parsed.isEvictionNotice,
-        confidence: parsed.confidence,
-        sourceSnippet: email.body.slice(0, 500),
-        subject: email.subject,
-        receivedAt: email.receivedAt,
-      });
-      assertOk("Bill.create", created);
-      const bill = created.data;
-      if (!bill) continue;
-      summary.billsCreated += 1;
-      candidates.unshift(bill); // newest first; visible to later emails in this run
-      await syncAlerts(bill.id, parsed, email.subject);
-    }
+    await recomputeAccount(account.id);
   }
 }
 
-/** Compact view of a tracked bill for the parser's reconciliation context. */
-function toCandidate(b: BillRecord): BillCandidate {
+/** Recompute an account's balance/flags by replaying all of its ledger entries. */
+async function recomputeAccount(accountId: string): Promise<void> {
+  const entries = await listAll((nextToken) =>
+    client.models.LedgerEntry.list({ filter: { accountId: { eq: accountId } }, nextToken }),
+  );
+  const state = projectAccount(entries.map(toEvent));
+
+  assertOk(
+    "Account.update",
+    await client.models.Account.update({
+      id: accountId,
+      currentAmount: state.currentAmount,
+      pastDueAmount: state.pastDueAmount,
+      balance: state.balance,
+      dueDate: state.dueDate ?? null,
+      cutoffDate: state.cutoffDate ?? null,
+      isPastDue: state.isPastDue,
+      isDisconnectWarning: state.isDisconnectWarning,
+      isEvictionNotice: state.isEvictionNotice,
+      lastEventAt: state.lastEventAt ?? null,
+    }),
+  );
+}
+
+function toEvent(e: LedgerEntryRecord): LedgerEvent {
   return {
-    amount: b.amount ?? null,
-    currency: b.currency ?? null,
-    statementDate: b.statementDate ?? null,
-    dueDate: b.dueDate ?? null,
-    status: b.status ?? null,
-    isPastDue: !!b.isPastDue,
-    isDisconnectWarning: !!b.isDisconnectWarning,
-    isEvictionNotice: !!b.isEvictionNotice,
-    subject: b.subject ?? null,
-    receivedAt: b.receivedAt ?? null,
+    kind: e.kind ?? "statement",
+    amount: e.amount ?? null,
+    assertedTotalDue: e.assertedTotalDue ?? null,
+    assertedPastDue: e.assertedPastDue ?? null,
+    assertedCurrent: e.assertedCurrent ?? null,
+    eventDate: e.eventDate ?? null,
+    dueDate: e.dueDate ?? null,
+    cutoffDate: e.cutoffDate ?? null,
+    isPastDue: !!e.isPastDue,
+    isDisconnectWarning: !!e.isDisconnectWarning,
+    isEvictionNotice: !!e.isEvictionNotice,
+    receivedAt: e.receivedAt ?? null,
   };
 }
 
-/** Make a bill's Alerts match its current urgent flags (clear all, then recreate). */
-async function syncAlerts(
-  billId: string,
-  flags: { isEvictionNotice: boolean; isDisconnectWarning: boolean; isPastDue: boolean },
-  excerpt: string,
-): Promise<void> {
-  const existing = await listAll((nextToken) =>
-    client.models.Alert.list({ filter: { billId: { eq: billId } }, nextToken }),
-  );
-  for (const a of existing) {
-    assertOk("Alert.delete", await client.models.Alert.delete({ id: a.id }));
+/** Resolves/creates Accounts by (biller, accountNumber), loading each biller's set once. */
+class AccountCache {
+  private byKey = new Map<string, AccountRecord>();
+  private loadedBillers = new Set<string>();
+
+  private static key(billerId: string, accountNumber: string): string {
+    return `${billerId}::${accountNumber}`;
   }
 
-  const alerts: { type: "disconnect" | "eviction" | "pastdue"; severity: number }[] = [];
-  if (flags.isEvictionNotice) alerts.push({ type: "eviction", severity: 3 });
-  if (flags.isDisconnectWarning) alerts.push({ type: "disconnect", severity: 2 });
-  if (flags.isPastDue) alerts.push({ type: "pastdue", severity: 1 });
-  for (const a of alerts) {
-    assertOk(
-      "Alert.create",
-      await client.models.Alert.create({
-        billId,
-        type: a.type,
-        severity: a.severity,
-        excerpt,
-        detectedAt: new Date().toISOString(),
-        acknowledged: false,
-      }),
-    );
+  async getOrCreate(
+    billerId: string,
+    accountNumber: string,
+    label: string | null,
+  ): Promise<AccountRecord> {
+    if (!this.loadedBillers.has(billerId)) {
+      const existing = await listAll((nextToken) =>
+        client.models.Account.list({ filter: { billerId: { eq: billerId } }, nextToken }),
+      );
+      for (const acc of existing) {
+        this.byKey.set(AccountCache.key(billerId, acc.accountNumber ?? ""), acc);
+      }
+      this.loadedBillers.add(billerId);
+    }
+
+    const key = AccountCache.key(billerId, accountNumber);
+    const found = this.byKey.get(key);
+    if (found) return found;
+
+    const created = await client.models.Account.create({
+      billerId,
+      accountNumber,
+      label: label ?? undefined,
+    });
+    assertOk("Account.create", created);
+    const account = created.data!;
+    this.byKey.set(key, account);
+    return account;
   }
 }
 

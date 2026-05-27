@@ -2,14 +2,14 @@ import { useState } from "react";
 import Dashboard from "./pages/Dashboard";
 import Scans from "./pages/Scans";
 import Billers from "./pages/Billers";
-import Bills from "./pages/Bills";
+import Accounts from "./pages/Accounts";
 
-type Tab = "dashboard" | "scans" | "billers" | "bills";
+type Tab = "dashboard" | "scans" | "billers" | "accounts";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "dashboard", label: "Dashboard" },
+  { id: "accounts", label: "Accounts" },
   { id: "billers", label: "Billers" },
-  { id: "bills", label: "Bills" },
   { id: "scans", label: "Scans" },
 ];
 
@@ -44,8 +44,8 @@ export default function App({ signOut, user }: AppProps) {
 
       <main className="content">
         {tab === "dashboard" && <Dashboard />}
+        {tab === "accounts" && <Accounts />}
         {tab === "billers" && <Billers />}
-        {tab === "bills" && <Bills />}
         {tab === "scans" && <Scans />}
       </main>
     </div>

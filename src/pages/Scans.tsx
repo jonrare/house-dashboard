@@ -41,22 +41,22 @@ export default function Scans() {
     }
   }
 
-  // Delete every imported Bill and Alert AND reset the incremental scan cursor, so a
+  // Delete every Account and LedgerEntry AND reset the incremental scan cursor, so a
   // plain "Scan now" afterward re-pulls recent mail instead of finding nothing. Billers
   // and sender filters are kept. (A Backfill still re-pulls the full 12-month history.)
-  async function clearBills() {
-    if (!confirm("Delete ALL imported bills and alerts, and reset the scan position? Billers and filters are kept. A scan or backfill will re-import them.")) return;
+  async function clearData() {
+    if (!confirm("Delete ALL accounts and ledger entries, and reset the scan position? Billers and filters are kept. A scan or backfill will re-import them.")) return;
     setClearing(true);
     setError(null);
     setNotice(null);
     try {
-      const alerts = await listAll((nextToken) => client.models.Alert.list({ nextToken }));
-      await Promise.all(alerts.map((a) => client.models.Alert.delete({ id: a.id })));
-      const bills = await listAll((nextToken) => client.models.Bill.list({ nextToken }));
-      await Promise.all(bills.map((b) => client.models.Bill.delete({ id: b.id })));
+      const entries = await listAll((nextToken) => client.models.LedgerEntry.list({ nextToken }));
+      await Promise.all(entries.map((e) => client.models.LedgerEntry.delete({ id: e.id })));
+      const accounts = await listAll((nextToken) => client.models.Account.list({ nextToken }));
+      await Promise.all(accounts.map((a) => client.models.Account.delete({ id: a.id })));
       // Reset the cursor so the next scan starts over (it's a no-op if none exists yet).
       await client.models.ScanState.delete({ id: "global" });
-      setNotice(`Cleared ${bills.length} bill(s) and ${alerts.length} alert(s), and reset the scan position.`);
+      setNotice(`Cleared ${accounts.length} account(s) and ${entries.length} ledger entr${entries.length === 1 ? "y" : "ies"}, and reset the scan position.`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -72,8 +72,8 @@ export default function Scans() {
           <button disabled={scanning} onClick={scanNow}>
             {scanning ? "Scanning…" : "Scan now"}
           </button>
-          <button className="danger" disabled={clearing} onClick={clearBills}>
-            {clearing ? "Clearing…" : "Clear all bills"}
+          <button className="danger" disabled={clearing} onClick={clearData}>
+            {clearing ? "Clearing…" : "Clear all data"}
           </button>
         </div>
       </div>
@@ -94,7 +94,7 @@ export default function Scans() {
             <th>Started</th>
             <th>Finished</th>
             <th>Messages</th>
-            <th>Bills</th>
+            <th>Entries</th>
             <th>Errors</th>
           </tr>
         </thead>
@@ -105,7 +105,7 @@ export default function Scans() {
               <td>{r.startedAt ? new Date(r.startedAt).toLocaleString() : "—"}</td>
               <td>{r.finishedAt ? new Date(r.finishedAt).toLocaleString() : "—"}</td>
               <td>{r.messagesScanned ?? 0}</td>
-              <td>{r.billsCreated ?? 0}</td>
+              <td>{r.entriesRecorded ?? 0}</td>
               <td className="err">{r.errors ?? ""}</td>
             </tr>
           ))}

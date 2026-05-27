@@ -7,8 +7,10 @@ import { scan } from "../functions/scan/resource";
  *
  * Flow: Biller + SenderFilter are user-managed config. The `scan` function reads
  * them, pulls matching messages from the one configured Gmail mailbox (GMAIL_ADDRESS
- * env var + GMAIL_APP_PASSWORD secret), parses each with Claude, and writes Bill
- * (+ Alert) records. ScanState holds the incremental cursor. See amplify/functions/scan.
+ * env var + GMAIL_APP_PASSWORD secret), and parses each into a LedgerEntry. An Account
+ * is a *projection* of its ledger: the scan replays a biller/account's entries in date
+ * order to recompute its balance and flags. ScanState holds the incremental cursor.
+ * See amplify/functions/scan.
  */
 const schema = a
   .schema({
@@ -24,10 +26,12 @@ const schema = a
       "other",
     ]),
 
-    // "dismissed" = a parsed record the user marked as not-a-bill / false positive.
-    BillStatus: a.enum(["unpaid", "paid", "pastdue", "dismissed"]),
-
-    AlertType: a.enum(["disconnect", "eviction", "pastdue", "other"]),
+    // The kind of event an email represents in the ledger.
+    //  statement  = a bill/statement/notice that asserts an amount owed (a snapshot)
+    //  payment    = a confirmed payment that draws the balance down
+    //  fee        = a standalone charge added to the balance (late fee, etc.)
+    //  adjustment = a manual or miscellaneous correction (credit/charge)
+    LedgerKind: a.enum(["statement", "payment", "fee", "adjustment"]),
 
     ScanMode: a.enum(["scheduled", "manual", "backfill"]),
 
@@ -38,7 +42,7 @@ const schema = a
         category: a.ref("BillerCategory").required(),
         notes: a.string(),
         senderFilters: a.hasMany("SenderFilter", "billerId"),
-        bills: a.hasMany("Bill", "billerId"),
+        accounts: a.hasMany("Account", "billerId"),
       })
       .authorization((allow) => [allow.authenticated()]),
 
@@ -53,41 +57,57 @@ const schema = a
       })
       .authorization((allow) => [allow.authenticated()]),
 
-    /** A parsed bill. `messageId` is the Gmail Message-ID, the dedupe key. */
-    Bill: a
+    /**
+     * A billing account with a running balance, identified by biller + account number.
+     * Every field below `accountNumber` is *derived* by replaying this account's ledger
+     * entries (see amplify/functions/scan/ledger.ts) — never edited directly by hand.
+     */
+    Account: a
       .model({
         billerId: a.id().required(),
         biller: a.belongsTo("Biller", "billerId"),
-        messageId: a.string().required(),
-        amount: a.float(),
-        currency: a.string().default("USD"),
-        balance: a.float(),
-        statementDate: a.date(),
+        // Provider account number (e.g. "2803243"); "" when the biller states none.
+        accountNumber: a.string().required(),
+        label: a.string(), // e.g. service location / type, for display
+        currentAmount: a.float().default(0), // current-period charges outstanding
+        pastDueAmount: a.float().default(0), // overdue portion outstanding
+        balance: a.float().default(0), // currentAmount + pastDueAmount
         dueDate: a.date(),
-        status: a.ref("BillStatus"),
+        cutoffDate: a.date(), // service disconnection date, if threatened
+        isPastDue: a.boolean().default(false),
+        isDisconnectWarning: a.boolean().default(false),
+        isEvictionNotice: a.boolean().default(false),
+        lastEventAt: a.datetime(),
+        entries: a.hasMany("LedgerEntry", "accountId"),
+      })
+      .authorization((allow) => [allow.authenticated()]),
+
+    /** One parsed email event. `messageId` is the Gmail Message-ID, the dedupe key. */
+    LedgerEntry: a
+      .model({
+        accountId: a.id().required(),
+        account: a.belongsTo("Account", "accountId"),
+        billerId: a.id().required(),
+        messageId: a.string().required(),
+        kind: a.ref("LedgerKind").required(),
+        // Magnitude of the event: payment/fee/adjustment amount.
+        amount: a.float(),
+        // Snapshot values a statement/notice asserts, used to recompute the balance.
+        assertedTotalDue: a.float(),
+        assertedPastDue: a.float(),
+        assertedCurrent: a.float(),
+        eventDate: a.date(), // payment date / statement date (falls back to receivedAt)
+        dueDate: a.date(),
+        cutoffDate: a.date(),
         isPastDue: a.boolean().default(false),
         isDisconnectWarning: a.boolean().default(false),
         isEvictionNotice: a.boolean().default(false),
         confidence: a.float(),
-        sourceSnippet: a.string(),
         subject: a.string(),
+        sourceSnippet: a.string(),
         receivedAt: a.datetime(),
-        alerts: a.hasMany("Alert", "billId"),
       })
       .secondaryIndexes((index) => [index("messageId")])
-      .authorization((allow) => [allow.authenticated()]),
-
-    /** A derived urgent item, so the dashboard can query "urgent" cheaply. */
-    Alert: a
-      .model({
-        billId: a.id().required(),
-        bill: a.belongsTo("Bill", "billId"),
-        type: a.ref("AlertType").required(),
-        severity: a.integer().default(1),
-        excerpt: a.string(),
-        detectedAt: a.datetime(),
-        acknowledged: a.boolean().default(false),
-      })
       .authorization((allow) => [allow.authenticated()]),
 
     /** Append-only log of scan runs for observability. */
@@ -97,7 +117,7 @@ const schema = a
         startedAt: a.datetime(),
         finishedAt: a.datetime(),
         messagesScanned: a.integer().default(0),
-        billsCreated: a.integer().default(0),
+        entriesRecorded: a.integer().default(0),
         errors: a.string(),
       })
       .authorization((allow) => [allow.authenticated()]),
