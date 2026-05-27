@@ -4,6 +4,7 @@ import { client, listAll, type ScanRun } from "../client";
 export default function Scans() {
   const [runs, setRuns] = useState<ScanRun[]>([]);
   const [scanning, setScanning] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -40,13 +41,39 @@ export default function Scans() {
     }
   }
 
+  // Delete every imported Bill and Alert so you can re-scan from a clean slate.
+  // Leaves billers, sender filters, and the scan cursor untouched; a Backfill
+  // re-imports history.
+  async function clearBills() {
+    if (!confirm("Delete ALL imported bills and alerts? Billers and filters are kept. A re-scan or backfill can re-import them.")) return;
+    setClearing(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const alerts = await listAll((nextToken) => client.models.Alert.list({ nextToken }));
+      await Promise.all(alerts.map((a) => client.models.Alert.delete({ id: a.id })));
+      const bills = await listAll((nextToken) => client.models.Bill.list({ nextToken }));
+      await Promise.all(bills.map((b) => client.models.Bill.delete({ id: b.id })));
+      setNotice(`Cleared ${bills.length} bill(s) and ${alerts.length} alert(s).`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setClearing(false);
+    }
+  }
+
   return (
     <div>
       <div className="page-head">
         <h2>Scans</h2>
-        <button disabled={scanning} onClick={scanNow}>
-          {scanning ? "Scanning…" : "Scan now"}
-        </button>
+        <div className="actions">
+          <button disabled={scanning} onClick={scanNow}>
+            {scanning ? "Scanning…" : "Scan now"}
+          </button>
+          <button className="danger" disabled={clearing} onClick={clearBills}>
+            {clearing ? "Clearing…" : "Clear all bills"}
+          </button>
+        </div>
       </div>
 
       {error && <p className="error-box">{error}</p>}

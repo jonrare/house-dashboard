@@ -5,7 +5,7 @@ import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtim
 import { env } from "$amplify/env/scan";
 import type { Schema } from "../../data/resource";
 import { fetchMatchingEmails, type SenderQuery } from "./gmail";
-import { parseBillEmail } from "./parse";
+import { parseBillEmail, type BillCandidate } from "./parse";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
 Amplify.configure(resourceConfig, libraryOptions);
@@ -17,6 +17,7 @@ const SCAN_STATE_ID = "global"; // singleton ScanState row holding the increment
 
 type Mode = "scheduled" | "manual" | "backfill";
 type SenderFilterRecord = Schema["SenderFilter"]["type"];
+type BillRecord = Schema["Bill"]["type"];
 
 interface ScanArgs {
   billerId?: string | null;
@@ -127,7 +128,7 @@ async function runBackfill(
   await scanFilters(filters, daysAgo(sinceDays), summary);
 }
 
-/** Fetch → dedupe → parse → write Bills/Alerts for the given sender filters. */
+/** Fetch → dedupe → reconcile (create / update / skip) → write Bills/Alerts. */
 async function scanFilters(
   filters: SenderFilterRecord[],
   since: Date,
@@ -150,6 +151,25 @@ async function scanFilters(
   const emails = await fetchMatchingEmails({ emailAddress: gmailAddress, appPassword, queries, since });
   summary.messagesScanned += emails.length;
 
+  // Process oldest first so a payment/resolution email is seen after the bill it affects.
+  emails.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt));
+
+  // Recent bills per biller, used as reconciliation context for the parser. Seeded from the
+  // DB on first use and kept in sync as we create/update bills within this run.
+  const candidatesByBiller = new Map<string, BillRecord[]>();
+  async function candidatesFor(billerId: string): Promise<BillRecord[]> {
+    let bills = candidatesByBiller.get(billerId);
+    if (!bills) {
+      const all = await listAll((nextToken) =>
+        client.models.Bill.list({ filter: { billerId: { eq: billerId } }, nextToken }),
+      );
+      all.sort((a, b) => (b.receivedAt ?? "").localeCompare(a.receivedAt ?? ""));
+      bills = all.slice(0, 25);
+      candidatesByBiller.set(billerId, bills);
+    }
+    return bills;
+  }
+
   for (const email of emails) {
     // Dedupe via the messageId secondary index (deterministic, unlike a filtered scan).
     const dupe = await client.models.Bill.listBillByMessageId(
@@ -162,49 +182,108 @@ async function scanFilters(
     const filter = byId.get(email.matchedQueryId);
     if (!filter) continue;
 
-    const parsed = await parseBillEmail(email);
-    if (!parsed.isBill) continue;
+    const candidates = await candidatesFor(filter.billerId);
+    const parsed = await parseBillEmail(email, candidates.map(toCandidate));
 
-    const created = await client.models.Bill.create({
-      billerId: filter.billerId,
-      messageId: email.messageId,
-      amount: parsed.amount ?? undefined,
-      currency: parsed.currency ?? "USD",
-      balance: parsed.balance ?? undefined,
-      statementDate: parsed.statementDate ?? undefined,
-      dueDate: parsed.dueDate ?? undefined,
-      status: parsed.status,
-      isPastDue: parsed.isPastDue,
-      isDisconnectWarning: parsed.isDisconnectWarning,
-      isEvictionNotice: parsed.isEvictionNotice,
-      confidence: parsed.confidence,
-      sourceSnippet: email.body.slice(0, 500),
-      subject: email.subject,
-      receivedAt: email.receivedAt,
-    });
-    assertOk("Bill.create", created);
-    const bill = created.data;
-    if (!bill) continue;
-    summary.billsCreated += 1;
+    if (parsed.action === "skip") continue;
 
-    // Emit Alerts for urgent flags so the dashboard can query them cheaply.
-    const alerts: { type: "disconnect" | "eviction" | "pastdue"; severity: number }[] = [];
-    if (parsed.isEvictionNotice) alerts.push({ type: "eviction", severity: 3 });
-    if (parsed.isDisconnectWarning) alerts.push({ type: "disconnect", severity: 2 });
-    if (parsed.isPastDue) alerts.push({ type: "pastdue", severity: 1 });
-    for (const a of alerts) {
-      assertOk(
-        "Alert.create",
-        await client.models.Alert.create({
-          billId: bill.id,
-          type: a.type,
-          severity: a.severity,
-          excerpt: email.subject,
-          detectedAt: new Date().toISOString(),
-          acknowledged: false,
-        }),
-      );
+    const target =
+      parsed.action === "update" && parsed.targetIndex != null
+        ? candidates[parsed.targetIndex]
+        : undefined;
+
+    if (target) {
+      // Update an existing bill (e.g. a payment that resolves a past-due/disconnect notice).
+      const updated = await client.models.Bill.update({
+        id: target.id,
+        amount: parsed.amount ?? undefined,
+        currency: parsed.currency ?? "USD",
+        balance: parsed.balance ?? undefined,
+        statementDate: parsed.statementDate ?? undefined,
+        dueDate: parsed.dueDate ?? undefined,
+        status: parsed.status,
+        isPastDue: parsed.isPastDue,
+        isDisconnectWarning: parsed.isDisconnectWarning,
+        isEvictionNotice: parsed.isEvictionNotice,
+        confidence: parsed.confidence,
+      });
+      assertOk("Bill.update", updated);
+      if (updated.data) Object.assign(target, updated.data); // keep the cached candidate current
+      await syncAlerts(target.id, parsed, email.subject);
+    } else {
+      // Create a new bill.
+      const created = await client.models.Bill.create({
+        billerId: filter.billerId,
+        messageId: email.messageId,
+        amount: parsed.amount ?? undefined,
+        currency: parsed.currency ?? "USD",
+        balance: parsed.balance ?? undefined,
+        statementDate: parsed.statementDate ?? undefined,
+        dueDate: parsed.dueDate ?? undefined,
+        status: parsed.status,
+        isPastDue: parsed.isPastDue,
+        isDisconnectWarning: parsed.isDisconnectWarning,
+        isEvictionNotice: parsed.isEvictionNotice,
+        confidence: parsed.confidence,
+        sourceSnippet: email.body.slice(0, 500),
+        subject: email.subject,
+        receivedAt: email.receivedAt,
+      });
+      assertOk("Bill.create", created);
+      const bill = created.data;
+      if (!bill) continue;
+      summary.billsCreated += 1;
+      candidates.unshift(bill); // newest first; visible to later emails in this run
+      await syncAlerts(bill.id, parsed, email.subject);
     }
+  }
+}
+
+/** Compact view of a tracked bill for the parser's reconciliation context. */
+function toCandidate(b: BillRecord): BillCandidate {
+  return {
+    amount: b.amount ?? null,
+    currency: b.currency ?? null,
+    statementDate: b.statementDate ?? null,
+    dueDate: b.dueDate ?? null,
+    status: b.status ?? null,
+    isPastDue: !!b.isPastDue,
+    isDisconnectWarning: !!b.isDisconnectWarning,
+    isEvictionNotice: !!b.isEvictionNotice,
+    subject: b.subject ?? null,
+    receivedAt: b.receivedAt ?? null,
+  };
+}
+
+/** Make a bill's Alerts match its current urgent flags (clear all, then recreate). */
+async function syncAlerts(
+  billId: string,
+  flags: { isEvictionNotice: boolean; isDisconnectWarning: boolean; isPastDue: boolean },
+  excerpt: string,
+): Promise<void> {
+  const existing = await listAll((nextToken) =>
+    client.models.Alert.list({ filter: { billId: { eq: billId } }, nextToken }),
+  );
+  for (const a of existing) {
+    assertOk("Alert.delete", await client.models.Alert.delete({ id: a.id }));
+  }
+
+  const alerts: { type: "disconnect" | "eviction" | "pastdue"; severity: number }[] = [];
+  if (flags.isEvictionNotice) alerts.push({ type: "eviction", severity: 3 });
+  if (flags.isDisconnectWarning) alerts.push({ type: "disconnect", severity: 2 });
+  if (flags.isPastDue) alerts.push({ type: "pastdue", severity: 1 });
+  for (const a of alerts) {
+    assertOk(
+      "Alert.create",
+      await client.models.Alert.create({
+        billId,
+        type: a.type,
+        severity: a.severity,
+        excerpt,
+        detectedAt: new Date().toISOString(),
+        acknowledged: false,
+      }),
+    );
   }
 }
 
